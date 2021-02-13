@@ -1,8 +1,18 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
+
+# loidor hack of mangadex-dl
+#
+# defaults to english
+# downloads url given as arg
+# retries 15 times if failing
+# checks image integrity
+# downloads main cover to title folder
+
 import cloudscraper
 import time, os, sys, re, json, html, random
+from PIL import Image
 
-A_VERSION = "0.3"
+A_VERSION = "X.X"
 
 def pad_filename(str):
 	digits = re.compile('(\\d+)')
@@ -26,13 +36,11 @@ def zpad(num):
 	else:
 		return num.zfill(3)
 
-def dl(manga_id, lang_code, tld="org"):
-	if len(tld) == 1: #
-		tld = "org"
+def dl(manga_id):
 	# grab manga info json from api
 	scraper = cloudscraper.create_scraper()
 	try:
-		r = scraper.get("https://api.mangadex.{}/v2/manga/{}/?include=chapters".format(tld, manga_id))
+		r = scraper.get("https://api.mangadex.org/v2/manga/{}/?include=chapters".format(manga_id))
 		jason = json.loads(r.text)
 	except (json.decoder.JSONDecodeError, ValueError) as err:
 		print("CloudFlare error: {}".format(err))
@@ -45,13 +53,30 @@ def dl(manga_id, lang_code, tld="org"):
 		title = jason["data"]["manga"]["title"]
 	except:
 		print("Please enter a valid MangaDex manga (not chapter) URL or ID.")
-		exit(1)
-	print("\nTITLE: {}".format(html.unescape(title)))
+	print("\nDownloading: {}".format(html.unescape(title)))
+
+	# Create title folder, download cover image
+	title = re.sub('[/<>:"/\\|?*]', '-', title)
+	title_dir = os.path.join(os.getcwd(), "download", title)
+	if not os.path.exists(title_dir):
+		os.makedirs(title_dir)
+
+	cover = jason["data"]["manga"]["mainCover"]
+#### Get ext from cover, create filename, download to filename
+	cover_ext = cover[-3:]
+	cover_path = title_dir+"/cover."+cover_ext
+	cover_file = scraper.get(cover)
+
+	if cover_file.status_code == 200:
+		with open(cover_path, 'wb') as f:
+			f.write(cover_file.content)
+
+	print(cover_path)
 
 	# check available chapters
 	chapters = []
 	for i in jason["data"]["chapters"]:
-		if i["language"] == lang_code:
+		if i["language"] == "gb":
 			chapters.append(i["chapter"])
 	chapters.sort(key=float_conversion) # sort numerically by chapter #
 
@@ -59,13 +84,10 @@ def dl(manga_id, lang_code, tld="org"):
 	if len(chapters) == 0:
 		print("No chapters available to download!")
 		exit(0)
-	else:
-		print("Available chapters:")
-		print(" " + ', '.join(map(str, chapters)))
 
 	# i/o for chapters to download
 	requested_chapters = []
-	chap_list = input("\nEnter chapter(s) to download: ").strip()
+	chap_list = chapters[0]+"-"+chapters[-1]
 	chap_list = [s for s in chap_list.split(',')]
 	for s in chap_list:
 		s = s.strip()
@@ -105,18 +127,25 @@ def dl(manga_id, lang_code, tld="org"):
 			chapter_num = str(float(i["chapter"]))
 			chapter_num = re.sub('.0$', '', chapter_num) # only replace at end (not chapter #s with decimals)
 		except: # oneshot
-			if "Oneshot" in requested_chapters and i["language"] == lang_code:
+			if "Oneshot" in requested_chapters and i["language"] == "gb":
 				chaps_to_dl.append(("Oneshot", i["id"]))
-		if chapter_num in requested_chapters and i["language"] == lang_code:
+		if chapter_num in requested_chapters and i["language"] == "gb":
 			chaps_to_dl.append((str(chapter_num), i["id"]))
 	chaps_to_dl.sort(key = lambda x: float_conversion(x[0]))
 
 	# get chapter(s) json
 	print()
 	for chapter_info in chaps_to_dl:
-		print("Downloading chapter {}...".format(chapter_info[0]))
-		r = scraper.get("https://api.mangadex.{}/v2/chapter/{}/".format(tld, chapter_info[1]))
+
+		r = scraper.get("https://api.mangadex.org/v2/chapter/{}/".format(chapter_info[1]))
 		chapter = json.loads(r.text)
+
+		# Get metadata
+		metadata_volume = chapter["data"]["volume"]
+		metadata_chapter = chapter["data"]["chapter"]
+		metadata_title = chapter["data"]["title"]
+
+		print("Downloading Vol. {}, Ch. {} - {}...".format(metadata_volume,metadata_chapter,metadata_title))
 
 		# get url list
 		images = []
@@ -127,44 +156,57 @@ def dl(manga_id, lang_code, tld="org"):
 		for page in chapter["data"]["pages"]:
 			images.append("{}{}/{}".format(server, hashcode, page))
 
-		# create combined group name
-		groups = ""
-		for i in range(len(chapter["data"]["groups"])):
-			if i > 0:
-				groups += " & "
-			groups += chapter["data"]["groups"][i]["name"]
-		groupname = re.sub('[/<>:"/\\|?*]', '-', groups)
-
 		# download images
 		for pagenum, url in enumerate(images, 1):
 			filename = os.path.basename(url)
 			ext = os.path.splitext(filename)[1]
 
 			title = re.sub('[/<>:"/\\|?*]', '-', title)
-			chapnum = zpad(chapter_info[0])
-			if chapnum != "Oneshot":
-				chapnum = 'c' + chapnum
-			dest_folder = os.path.join(os.getcwd(), "download", title, "{} [{}]".format(chapnum, groupname))
+			dest_folder = os.path.join(os.getcwd(), "download", title, "Vol. {}, Ch. {} - {}".format(metadata_volume, metadata_chapter, metadata_title))
 			if not os.path.exists(dest_folder):
 				os.makedirs(dest_folder)
 			dest_filename = pad_filename("{}{}".format(pagenum, ext))
 			outfile = os.path.join(dest_folder, dest_filename)
 
-			r = scraper.get(url)
-			if r.status_code == 200:
-				with open(outfile, 'wb') as f:
-					f.write(r.content)
-					print(" Downloaded page {}.".format(pagenum))
-			else:
-				# silently try again
-				time.sleep(3)
+			verify_check = 0
+
+			while verify_check == 0:
 				r = scraper.get(url)
 				if r.status_code == 200:
 					with open(outfile, 'wb') as f:
 						f.write(r.content)
+						# verify downloaded file
+						testpage = Image.open(outfile)
+						try:
+							testpage.verify()
+							verify_check = 1
+						except Exception:
+							print("  File verification failed, trying again...")
+							continue
 						print(" Downloaded page {}.".format(pagenum))
 				else:
-					print(" Skipping download of page {} - error {}.".format(pagenum, r.status_code))
+					# silently try again 15 times
+					counter=0
+
+					while counter < 15:
+						time.sleep(3)
+						r = scraper.get(url)
+						if r.status_code == 200:
+							with open(outfile, 'wb') as f:
+								f.write(r.content)
+								testpage = Image.open(outfile)
+								try:
+									testpage.verify()
+									verify_check = 1
+								except Exception:
+									print("  **COUGH! COUGH!**")
+									continue
+								print(" Downloaded page {}.".format(pagenum))
+								break
+						else:
+							counter += 1
+							print("  **HICCUP!**")
+							continue
 			time.sleep(1)
 
 	print("Done!")
@@ -173,11 +215,9 @@ if __name__ == "__main__":
 	print("mangadex-dl v{}".format(A_VERSION))
 
 	if len(sys.argv) > 1:
-		lang_code = sys.argv[1]
+		url = sys.argv[1]
 	else:
-		lang_code = "gb"
-
-	url = ""
+		url = ""
 	while url == "":
 		url = input("Enter manga URL or ID: ").strip()
 	try:
@@ -190,4 +230,4 @@ if __name__ == "__main__":
 		print("Error with URL.")
 		exit(1)
 
-	dl(manga_id, lang_code, url[-1])
+	dl(manga_id)
